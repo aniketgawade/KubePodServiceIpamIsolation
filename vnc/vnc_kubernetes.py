@@ -51,6 +51,7 @@ class VncKubernetes(VncCommon):
         self.q = q
         self.kube = kube
         self._cluster_pod_ipam_fq_name = None
+        self._cluster_service_ipam_fq_name = None
 
         # init vnc connection
         self.vnc_lib = self._vnc_connect()
@@ -99,6 +100,7 @@ class VncKubernetes(VncCommon):
             # Update common config.
             self.vnc_kube_config.update(
                 cluster_pod_ipam_fq_name=self._get_cluster_pod_ipam_fq_name(),
+                cluster_service_ipam_fq_name=self._get_cluster_service_ipam_fq_name(),
                 cluster_service_fip_pool=self._get_cluster_service_fip_pool())
 
         # handle events
@@ -259,15 +261,16 @@ class VncKubernetes(VncCommon):
         # Create Service IPAM.
         #
         svc_ipam_update, svc_ipam_obj, svc_ipam_subnets = \
-            self._create_ipam('service-ipam', self.args.service_subnets, proj_obj)
+            self._create_ipam('service-ipam', self.args.service_subnets,
+                              proj_obj, type='flat-subnet')
+        # Cache cluster pod ipam name.
+        # This will be referenced by ALL pods that are spawned in the cluster.
+        self._cluster_service_ipam_fq_name = svc_ipam_obj.get_fq_name()
 
         # Attach Service IPAM to virtual-network.
-        svc_subnet = None
-        if len(svc_ipam_subnets):
-            svc_subnet = svc_ipam_subnets[0].subnet
         if svc_ipam_update or \
-           not self._is_ipam_exists(vn_obj, svc_ipam_obj.get_fq_name(), svc_subnet):
-            vn_obj.add_network_ipam(svc_ipam_obj, VnSubnetsType(svc_ipam_subnets))
+           not self._is_ipam_exists(vn_obj, svc_ipam_obj.get_fq_name()):
+            vn_obj.add_network_ipam(svc_ipam_obj, VnSubnetsType([]))
 
         vn_obj.set_virtual_network_properties(
              VirtualNetworkType(forwarding_mode='l3'))
@@ -387,6 +390,9 @@ class VncKubernetes(VncCommon):
 
     def _get_cluster_pod_ipam_fq_name(self):
         return self._cluster_pod_ipam_fq_name
+
+    def _get_cluster_service_ipam_fq_name(self):
+        return self._cluster_service_ipam_fq_name
 
     def vnc_timer(self):
         try:

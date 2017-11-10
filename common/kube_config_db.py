@@ -148,6 +148,7 @@ class NamespaceKM(KubeDBBase):
         self.name = None
         self.labels = {}
         self.isolated_vn_fq_name = None
+        self.isolated_service_vn_fq_name = None
         self.annotated_vn_fq_name = None
         self.annotations = None
         self.np_annotations = None
@@ -229,6 +230,12 @@ class NamespaceKM(KubeDBBase):
 
     def get_isolated_network_fq_name(self):
         return self.isolated_vn_fq_name
+
+    def set_isolated_service_network_fq_name(self, fq_name):
+        self.isolated_service_vn_fq_name = fq_name
+
+    def get_isolated_service_network_fq_name(self):
+        return self.isolated_service_vn_fq_name
 
     def get_annotated_network_fq_name(self):
         return self.annotated_vn_fq_name

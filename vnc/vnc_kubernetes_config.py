@@ -52,6 +52,10 @@ class VncKubernetesConfig(object):
         return cls.vnc_kubernetes_config.get("cluster_pod_ipam_fq_name", None)
 
     @classmethod
+    def service_ipam_fq_name(cls):
+        return cls.vnc_kubernetes_config.get("cluster_service_ipam_fq_name", None)
+
+    @classmethod
     def service_fip_pool(cls):
         return cls.vnc_kubernetes_config.get("cluster_service_fip_pool", None)
 

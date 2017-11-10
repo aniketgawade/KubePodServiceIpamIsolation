@@ -50,6 +50,9 @@ class VncNamespace(VncCommon):
     def _get_namespace_vn_name(self, ns_name):
         return ns_name + "-vn"
 
+    def _get_namespace_service_vn_name(self, ns_name):
+        return ns_name + "-service-vn"
+
     def _is_namespace_isolated(self, ns_name):
         """
         Check if this namespace is configured as isolated.
@@ -99,6 +102,12 @@ class VncNamespace(VncCommon):
         ns = self._get_namespace(ns_name)
         if ns:
             return ns.set_isolated_network_fq_name(fq_name)
+        return None
+
+    def _set_namespace_service_virtual_network(self, ns_name, fq_name):
+        ns = self._get_namespace(ns_name)
+        if ns:
+            return ns.set_isolated_service_network_fq_name(fq_name)
         return None
 
     def _clear_namespace_label_cache(self, ns_uuid, project):
@@ -230,6 +239,43 @@ class VncNamespace(VncCommon):
         # Clear network info from namespace entry.
         self._set_namespace_virtual_network(ns_name, None)
 
+    def _create_isolated_ns_service_virtual_network(self, ns_name, vn_name, proj_obj):
+        """
+        Create a service virtual network for this namespace.
+        """
+        vn = VirtualNetwork(name=vn_name, parent_obj=proj_obj,
+            virtual_network_properties=VirtualNetworkType(forwarding_mode='l3'),
+            address_allocation_mode='flat-subnet-only')
+
+        # Add annotatins on this isolated service virtual-network.
+        VirtualNetworkKM.add_annotations(self, vn, namespace=ns_name,
+            name=ns_name, isolated='True')
+
+        try:
+            vn_uuid = self._vnc_lib.virtual_network_create(vn)
+        except RefsExistError:
+            vn_obj = self._vnc_lib.virtual_network_read(
+                fq_name=vn.get_fq_name())
+            vn_uuid = vn_obj.uuid
+
+        # Instance-Ip for pods on this VN, should be allocated from
+        # cluster pod ipam. Attach the cluster pod-ipam object
+        # to this virtual network.
+        ipam_obj = self._vnc_lib.network_ipam_read(
+            fq_name=vnc_kube_config.service_ipam_fq_name())
+        vn.add_network_ipam(ipam_obj, VnSubnetsType([]))
+
+        # Update VN.
+        self._vnc_lib.virtual_network_update(vn)
+
+        # Cache the virtual network.
+        VirtualNetworkKM.locate(vn_uuid)
+
+        # Cache network info in namespace entry.
+        self._set_namespace_service_virtual_network(ns_name, vn.get_fq_name())
+
+        return vn_uuid
+
     def _update_security_groups(self, ns_name, proj_obj, network_policy):
         def _get_rule(ingress, sg, prefix, ethertype):
             sgr_uuid = str(uuid.uuid4())
@@ -355,6 +401,10 @@ class VncNamespace(VncCommon):
         if self._is_namespace_isolated(name) == True:
             vn_name = self._get_namespace_vn_name(name)
             self._create_isolated_ns_virtual_network(ns_name=name,
+                                                     vn_name=vn_name,
+                                                     proj_obj=proj_obj)
+            svc_vn_name = self._get_namespace_service_vn_name(name)
+            self._create_isolated_ns_service_virtual_network(ns_name=name,
                                                      vn_name=vn_name,
                                                      proj_obj=proj_obj)
 
