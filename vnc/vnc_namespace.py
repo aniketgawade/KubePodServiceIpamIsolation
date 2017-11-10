@@ -405,7 +405,7 @@ class VncNamespace(VncCommon):
                                                      proj_obj=proj_obj)
             svc_vn_name = self._get_namespace_service_vn_name(name)
             self._create_isolated_ns_service_virtual_network(ns_name=name,
-                                                     vn_name=vn_name,
+                                                     vn_name=svc_vn_name,
                                                      proj_obj=proj_obj)
 
         try:
