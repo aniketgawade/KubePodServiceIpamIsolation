@@ -15,12 +15,12 @@ from vnc_api.vnc_api import (
     PolicyEntriesType, IdPermsType, SecurityGroup, VirtualNetwork,
     VirtualNetworkType, NoIdError, VirtualMachine, VirtualMachineInterface,
     InstanceIp, NetworkIpam, IpamSubnets, IpamSubnetType, VnSubnetsType,
-    KeyValuePair, KeyValuePairs)
+    VirtualRouter)
 from kube_manager.common import args as kube_args
 from kube_manager.vnc import vnc_kubernetes
 from kube_manager.vnc import vnc_kubernetes_config as vnc_kube_config
 from kube_manager.vnc.config_db import (
-    VirtualMachineInterfaceKM, InstanceIpKM, VirtualMachineKM, DBBaseKM)
+    VirtualMachineInterfaceKM, InstanceIpKM, VirtualMachineKM, VirtualRouterKM)
 
 
 class KMTestCase(test_common.TestCase):
@@ -60,6 +60,7 @@ class KMTestCase(test_common.TestCase):
         cls.vnc_kubernetes_config_dict = None
         cls.event_queue = gevent.queue.Queue()
         cls.spawn_kube_manager(extra_args=kube_args)
+        cls.kubernetes_node_ip = '192.168.0.1'
 
     @classmethod
     def spawn_kube_manager(cls, extra_args=()):
@@ -297,6 +298,28 @@ class KMTestCase(test_common.TestCase):
 
         return vn_obj
 
+    @classmethod
+    def create_virtual_router(cls, name, node_ip=None):
+        vrouter_node_ip = node_ip if node_ip else cls.get_kubernetes_node_ip()
+        vrouter_obj = VirtualRouter(
+            name,
+            virtual_router_ip_address=vrouter_node_ip)
+        try:
+            vrouter_obj = cls._vnc_lib.virtual_router_read(
+                fq_name=vrouter_obj.get_fq_name())
+        except NoIdError:
+            cls._vnc_lib.virtual_router_create(vrouter_obj)
+            VirtualRouterKM.locate(vrouter_obj.uuid)
+        return vrouter_obj
+
+    @classmethod
+    def delete_virtual_router(cls, vrouter_uuid):
+        try:
+            cls._vnc_lib.virtual_router_delete(id=vrouter_uuid)
+        except NoIdError:
+            pass
+        VirtualRouterKM.delete(vrouter_uuid)
+
     def create_virtual_machine(self, name, vn, ipaddress):
         vm = VirtualMachine(name)
         self._vnc_lib.virtual_machine_create(vm)
@@ -306,9 +329,6 @@ class KMTestCase(test_common.TestCase):
             parent_type='virtual-machine', fq_name=[name, '0'])
         vmi.set_virtual_machine(vm)
         vmi.set_virtual_network(vn)
-        if DBBaseKM.is_nested():
-            vmi.set_virtual_machine_interface_bindings(
-                KeyValuePairs([KeyValuePair('host_id', 'WHATEVER')]))
         self._vnc_lib.virtual_machine_interface_create(vmi)
         VirtualMachineInterfaceKM.locate(vmi.uuid)
 
@@ -334,3 +354,7 @@ class KMTestCase(test_common.TestCase):
 
         self.vmi_clean(vm_instance)
         self._vnc_lib.virtual_machine_delete(id=vm_instance.uuid)
+
+    @classmethod
+    def get_kubernetes_node_ip(cls):
+        return cls.kubernetes_node_ip

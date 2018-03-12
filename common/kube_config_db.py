@@ -147,7 +147,7 @@ class NamespaceKM(KubeDBBase):
         # Metadata.
         self.name = None
         self.labels = {}
-        self.isolated_vn_fq_name = None
+        self.isolated_pod_vn_fq_name = None
         self.isolated_service_vn_fq_name = None
         self.annotated_vn_fq_name = None
         self.annotations = None
@@ -158,7 +158,6 @@ class NamespaceKM(KubeDBBase):
 
         # Config cache.
         self.isolated = False
-        self.service_isolated = False
 
         # If an object is provided, update self with contents of object.
         if obj:
@@ -200,12 +199,6 @@ class NamespaceKM(KubeDBBase):
             annotations['opencontrail.org/isolation'] == "true":
             # Namespace isolation is configured
             self.isolated = True
-            self.service_isolated = True
-        # Cache service isolation directive.
-        if 'opencontrail.org/isolation.service' in annotations and \
-            annotations['opencontrail.org/isolation.service'] == "false":
-            # Service isolation is disabled
-            self.service_isolated = False
         # Cache k8s network-policy directive.
         if 'net.beta.kubernetes.io/network-policy' in annotations:
             self.np_annotations = json.loads(
@@ -219,17 +212,14 @@ class NamespaceKM(KubeDBBase):
     def is_isolated(self):
         return self.isolated
 
-    def is_service_isolated(self):
-        return self.service_isolated
-
     def get_network_policy_annotations(self):
         return self.np_annotations
 
-    def set_isolated_network_fq_name(self, fq_name):
-        self.isolated_vn_fq_name = fq_name
+    def set_isolated_pod_network_fq_name(self, fq_name):
+        self.isolated_pod_vn_fq_name = fq_name
 
-    def get_isolated_network_fq_name(self):
-        return self.isolated_vn_fq_name
+    def get_isolated_pod_network_fq_name(self):
+        return self.isolated_pod_vn_fq_name
 
     def set_isolated_service_network_fq_name(self, fq_name):
         self.isolated_service_vn_fq_name = fq_name

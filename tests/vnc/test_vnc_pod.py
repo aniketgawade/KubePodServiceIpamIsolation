@@ -6,14 +6,16 @@ import uuid
 from collections import namedtuple
 import ipaddress
 
+from cfgm_common.exceptions import NoIdError
+
 from kube_manager.tests.vnc.test_case import KMTestCase
 from kube_manager.common.kube_config_db import (NamespaceKM, PodKM)
 from kube_manager.vnc.config_db import (
     VirtualNetworkKM, VirtualMachineKM, VirtualMachineInterfaceKM)
-from kube_manager.kube_manager import NoIdError
 from kube_manager.vnc import vnc_kubernetes_config as kube_config
 
 TestPod = namedtuple('TestPod', ['uuid', 'meta', 'spec'])
+
 
 class VncPodTest(KMTestCase):
     def setUp(self, extra_config_knobs=None):
@@ -31,12 +33,18 @@ class VncPodTest(KMTestCase):
         cls.cluster_project = 'test-project'
         cls.vn_name = 'test-network'
         cls.ns_name = 'test-namespace'
-        cls.pod_name = 'test-pod'
-        cls.pod_status = {'hostIP': '192.168.0.1', 'phase': 'created'}
 
-        cn_dict = {'domain': cls.domain,
-                   'project': cls.cluster_project,
-                   'name': cls.vn_name}
+        cls.pod_name = 'test-pod'
+        cls.pod_status = {
+            'hostIP': cls.get_kubernetes_node_ip(),
+            'phase': 'created'
+        }
+
+        cn_dict = {
+            'domain': cls.domain,
+            'project': cls.cluster_project,
+            'name': cls.vn_name
+        }
         cp_dict = {'project': cls.cluster_project}
 
         kube_config.VncKubernetesConfig.args().cluster_project = repr(cp_dict)
@@ -45,12 +53,19 @@ class VncPodTest(KMTestCase):
             'cluster_pod_ipam_fq_name'] = \
             ['default-domain', cls.cluster_project, 'pod-ipam']
 
+        # Create Vrouter Object.
+        cls.vrouter_name = 'test-VncPodTest-vrouter'
+        cls.vrouter_obj = cls.create_virtual_router(cls.vrouter_name)
+
     @classmethod
     def tearDownClass(cls):
         for pod in list(PodKM):
             PodKM.delete(pod)
         for namespace in list(NamespaceKM):
             NamespaceKM.delete(namespace)
+
+        # Cleanup the Vrouter object.
+        cls.delete_virtual_router(cls.vrouter_obj.uuid)
 
         super(VncPodTest, cls).tearDownClass()
 
@@ -171,13 +186,12 @@ class VncPodTestClusterProjectDefined(VncPodTest):
         super(VncPodTestClusterProjectDefined, self).tearDown()
 
     def _add_update_pod(self, action):
-        ns_name = self.ns_name + '_' + str(uuid.uuid4)
+        ns_name = self.ns_name + '_' + str(uuid.uuid4())
         self._create_namespace(ns_name, None)
 
         proj_fq_name = ['default-domain', self.cluster_project]
         proj_obj = self._vnc_lib.project_read(fq_name=proj_fq_name)
         vn_obj_uuid = self._create_virtual_network(proj_obj, self.vn_name).uuid
-
         testpod = self._create_update_pod(self.pod_name,
                                           ns_name,
                                           self.pod_status,
@@ -257,6 +271,7 @@ class VncPodTestClusterProjectDefined(VncPodTest):
         vn_obj = VirtualNetworkKM.locate(vn_obj.uuid)
         self.assertTrue(len(vn_obj.instance_ips) == 0)
 
+
 class VncPodTestClusterProjectUndefined(VncPodTestClusterProjectDefined):
     def setUp(self, extra_config_knobs=None):
         super(VncPodTestClusterProjectUndefined, self).setUp(
@@ -299,7 +314,6 @@ class VncPodTestNamespaceIsolation(VncPodTest):
         cls.ns_name = 'test-namespace-isolated'
         cls.cluster_project = cls.ns_name
         cls.vn_name = cls.ns_name + '-vn'
-
         args = {}
         args['domain'] = 'default-domain'
         args['project'] = cls.cluster_project
@@ -344,6 +358,7 @@ class VncPodTestNamespaceIsolation(VncPodTest):
         vn_obj = VirtualNetworkKM.locate(vn_obj.uuid)
         self.assertTrue(len(vn_obj.instance_ips) == 0)
 
+
 class VncPodTestCustomNetworkAnnotation(VncPodTest):
     def setUp(self, extra_config_knobs=None):
         super(VncPodTestCustomNetworkAnnotation, self).setUp(
@@ -360,7 +375,6 @@ class VncPodTestCustomNetworkAnnotation(VncPodTest):
                              "project":"%s",\
                              "name":"%s"}' % (cls.cluster_project,
                                               cls.vn_name)
-
 
     def test_pod_add_delete_with_namespace_custom_network_annotation(self):
         proj_obj = self.create_project(self.cluster_project)

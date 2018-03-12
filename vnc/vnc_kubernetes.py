@@ -100,8 +100,7 @@ class VncKubernetes(VncCommon):
             # Update common config.
             self.vnc_kube_config.update(
                 cluster_pod_ipam_fq_name=self._get_cluster_pod_ipam_fq_name(),
-                cluster_service_ipam_fq_name=self._get_cluster_service_ipam_fq_name(),
-                cluster_service_fip_pool=self._get_cluster_service_fip_pool())
+                cluster_service_ipam_fq_name=self._get_cluster_service_ipam_fq_name())
 
         # handle events
         self.label_cache = label_cache.LabelCache()
@@ -163,6 +162,66 @@ class VncKubernetes(VncCommon):
         for cls in DBBaseKM.get_obj_type_map().values():
             cls.reset()
 
+    def _create_policy(self, policy_name, proj_obj, src_vn_obj, dst_vn_obj):
+        policy_exists = False
+        policy = NetworkPolicy(name=policy_name, parent_obj=proj_obj)
+        try:
+            policy_obj = self.vnc_lib.network_policy_read(
+                fq_name=policy.get_fq_name())
+            policy_exists = True
+        except NoIdError:
+            # policy does not exist. Create one.
+            policy_obj = policy
+        network_policy_entries = PolicyEntriesType(
+            [PolicyRuleType(
+                direction = '<>',
+                action_list = ActionListType(simple_action='pass'),
+                protocol = 'any',
+                src_addresses = [
+                    AddressType(virtual_network = src_vn_obj.get_fq_name_str())
+                ],
+                src_ports = [PortType(-1, -1)],
+                dst_addresses = [
+                    AddressType(virtual_network = dst_vn_obj.get_fq_name_str())
+                ],
+                dst_ports = [PortType(-1, -1)])
+            ])
+        policy_obj.set_network_policy_entries(network_policy_entries)
+        if policy_exists:
+            self.vnc_lib.network_policy_update(policy)
+        else:
+            self.vnc_lib.network_policy_create(policy)
+        return policy_obj
+
+    def _attach_policy(self, vn_obj, *policies):
+        for policy in policies or []:
+            vn_obj.add_network_policy(policy, \
+                VirtualNetworkPolicyType(sequence=SequenceType(0, 0)))
+        self.vnc_lib.virtual_network_update(vn_obj)
+        for policy in policies or []:
+            self.vnc_lib.ref_relax_for_delete(vn_obj.uuid, policy.uuid)
+
+    def _create_attach_policy(self, proj_obj, ip_fabric_vn_obj, \
+            cluster_pod_vn_obj, cluster_service_vn_obj):
+        policy_name = '%s-%s-default' \
+            %(ip_fabric_vn_obj.name, cluster_pod_vn_obj.name)
+        ip_fabric_pod_policy = self._create_policy(policy_name, proj_obj, \
+            ip_fabric_vn_obj, cluster_pod_vn_obj)
+        policy_name = '%s-%s-default'\
+            %(ip_fabric_vn_obj.name, cluster_service_vn_obj.name)
+        ip_fabric_service_policy = self._create_policy(policy_name, proj_obj, \
+            ip_fabric_vn_obj, cluster_service_vn_obj)
+        policy_name = '%s-%s-default'\
+            %(cluster_service_vn_obj.name, cluster_pod_vn_obj.name)
+        service_pod_policy = self._create_policy(policy_name, proj_obj, \
+            cluster_service_vn_obj, cluster_pod_vn_obj)
+        self._attach_policy(ip_fabric_vn_obj, \
+            ip_fabric_pod_policy, ip_fabric_service_policy)
+        self._attach_policy(cluster_pod_vn_obj, \
+            ip_fabric_pod_policy, service_pod_policy)
+        self._attach_policy(cluster_service_vn_obj, \
+            ip_fabric_service_policy, service_pod_policy)
+
     def _create_project(self, project_name):
         proj_fq_name = vnc_kube_config.cluster_project_fq_name(project_name)
         proj_obj = Project(name=proj_fq_name[-1], fq_name=proj_fq_name)
@@ -175,7 +234,7 @@ class VncKubernetes(VncCommon):
         return proj_obj
 
     def _create_ipam(self, ipam_name, subnets, proj_obj,
-            type='user-defined-subnet'):
+            type='flat-subnet'):
         ipam_obj = NetworkIpam(name=ipam_name, parent_obj=proj_obj)
 
         ipam_subnets = []
@@ -196,10 +255,10 @@ class VncKubernetes(VncCommon):
             ipam_uuid = self.vnc_lib.network_ipam_create(ipam_obj)
             ipam_update = True
         except RefsExistError:
-            ipam_obj = self.vnc_lib.network_ipam_read(
+            curr_ipam_obj = self.vnc_lib.network_ipam_read(
                 fq_name=ipam_obj.get_fq_name())
-            ipam_uuid = ipam_obj.get_uuid()
-            if type == 'flat-subnet' and not ipam_obj.get_ipam_subnets():
+            ipam_uuid = curr_ipam_obj.get_uuid()
+            if type == 'flat-subnet' and not curr_ipam_obj.get_ipam_subnets():
                 self.vnc_lib.network_ipam_update(ipam_obj)
                 ipam_update = True
 
@@ -225,7 +284,36 @@ class VncKubernetes(VncCommon):
                        return True
         return False
 
-    def _create_cluster_network(self, vn_name, proj_obj):
+    def _provision_cluster(self):
+        proj_obj = self._create_project(\
+            vnc_kube_config.cluster_default_project_name())
+        ip_fabric_fq_name = vnc_kube_config.cluster_ip_fabric_network_fq_name()
+        ip_fabric_vn_obj = self.vnc_lib. \
+            virtual_network_read(fq_name=ip_fabric_fq_name)
+        self._create_project('kube-system')
+        # Create Pod IPAM.
+        pod_ipam_update, pod_ipam_obj, pod_ipam_subnets = \
+            self._create_ipam('pod-ipam', self.args.pod_subnets, proj_obj)
+        # Cache cluster pod ipam name.
+        # This will be referenced by ALL pods that are spawned in the cluster.
+        self._cluster_pod_ipam_fq_name = pod_ipam_obj.get_fq_name()
+        # Create a cluster-pod-network
+        cluster_pod_vn_obj = self._create_network(
+            vnc_kube_config.cluster_default_pod_network_name(), proj_obj, \
+            pod_ipam_obj, pod_ipam_update, ip_fabric_vn_obj)
+        # Create Service IPAM.
+        service_ipam_update, service_ipam_obj, service_ipam_subnets = \
+            self._create_ipam('service-ipam', self.args.service_subnets, proj_obj)
+        self._cluster_service_ipam_fq_name = service_ipam_obj.get_fq_name()
+        # Create a cluster-service-network
+        cluster_service_vn_obj = self._create_network(
+            vnc_kube_config.cluster_default_service_network_name(), proj_obj, \
+            service_ipam_obj, service_ipam_update)
+        self._create_attach_policy(proj_obj, ip_fabric_vn_obj, \
+            cluster_pod_vn_obj, cluster_service_vn_obj)
+
+    def _create_network(self, vn_name, proj_obj, \
+            ipam_obj, ipam_update, provider=None):
         # Check if the VN already exists.
         # If yes, update existing VN object with k8s config.
         vn_exists = False
@@ -239,41 +327,25 @@ class VncKubernetes(VncCommon):
             # VN does not exist. Create one.
             vn_obj = vn
 
-        # Create Pod IPAM.
-        pod_ipam_update, pod_ipam_obj, pod_ipam_subnets = \
-            self._create_ipam('pod-ipam',
-                self.args.pod_subnets, proj_obj, type='flat-subnet')
-
-        # Cache cluster pod ipam name.
-        # This will be referenced by ALL pods that are spawned in the cluster.
-        self._cluster_pod_ipam_fq_name = pod_ipam_obj.get_fq_name()
-
-        # Attach Pod IPAM to cluster virtual network.
+        # Attach IPAM to virtual network.
         #
         # For flat-subnets, the subnets are specified on the IPAM and
         # not on the virtual-network to IPAM link. So pass an empty
         # list of VnSubnetsType.
-        if pod_ipam_update or \
-           not self._is_ipam_exists(vn_obj, pod_ipam_obj.get_fq_name()):
-            vn_obj.add_network_ipam(pod_ipam_obj, VnSubnetsType([]))
-
-        #
-        # Create Service IPAM.
-        #
-        svc_ipam_update, svc_ipam_obj, svc_ipam_subnets = \
-            self._create_ipam('service-ipam', self.args.service_subnets,
-                              proj_obj, type='flat-subnet')
-        # Cache cluster pod ipam name.
-        # This will be referenced by ALL pods that are spawned in the cluster.
-        self._cluster_service_ipam_fq_name = svc_ipam_obj.get_fq_name()
-
-        # Attach Service IPAM to virtual-network.
-        if svc_ipam_update or \
-           not self._is_ipam_exists(vn_obj, svc_ipam_obj.get_fq_name()):
-            vn_obj.add_network_ipam(svc_ipam_obj, VnSubnetsType([]))
+        if ipam_update or \
+           not self._is_ipam_exists(vn_obj, ipam_obj.get_fq_name()):
+            vn_obj.add_network_ipam(ipam_obj, VnSubnetsType([]))
 
         vn_obj.set_virtual_network_properties(
              VirtualNetworkType(forwarding_mode='l3'))
+
+        if provider:
+            vn_obj.add_virtual_network(provider)
+        else:
+            vn_refs = vn_obj.get_virtual_network_refs()
+            for vn_ref in vn_refs or []:
+                vn_ref_obj = self.vnc_lib.virtual_network_read(id=vn_ref['uuid'])
+                vn_obj.del_virtual_network(vn_ref_obj)
 
         if vn_exists:
             # Update VN.
@@ -286,103 +358,8 @@ class VncKubernetes(VncCommon):
         vn_obj = self.vnc_lib.virtual_network_read(
             fq_name=vn_obj.get_fq_name())
 
-        # Create service floating ip pool.
-        self._create_cluster_service_fip_pool(vn_obj, pod_ipam_obj)
-
         VirtualNetworkKM.locate(vn_obj.uuid)
-        return vn_obj.uuid
-
-    def _get_cluster_service_fip_pool_name(self, vn_name):
-        """
-        Return fip pool name of cluster service network.
-        """
-        return 'svc-fip-pool-%s' %(vn_name)
-
-    def _get_cluster_service_fip_pool(self):
-        """
-        Get floating ip pool of cluster service network.
-        """
-        vn_obj = self._get_cluster_network()
-        return FloatingIpPoolKM.find_by_name_or_uuid(
-            self._get_cluster_service_fip_pool_name(vn_obj.name))
-
-    def _create_cluster_service_fip_pool(self, vn_obj, ipam_obj):
-        # Create a floating-ip-pool in cluster service network.
-        #
-        # Service IP's in the k8s cluster are allocated from pod
-        # IPAM in the cluster network. All pods spawned in isolated
-        # virtual networks will be allocated an IP from this floating-ip-
-        # pool. These pods, in those isolated virtual networks, will use this
-        # floating-ip for outbound traffic to services in the k8s cluster.
-
-        # Get IPAM refs from virtual-network.
-        ipam_refs = vn_obj.get_network_ipam_refs()
-        svc_subnet_uuid = None
-        for ipam_ref in ipam_refs:
-            if ipam_ref['to'] == ipam_obj.get_fq_name():
-                ipam_subnets = ipam_ref['attr'].get_ipam_subnets()
-                if not ipam_subnets:
-                    continue
-                # We will use the first subnet in the matching IPAM.
-                svc_subnet_uuid = ipam_subnets[0].get_subnet_uuid()
-                break
-
-        fip_subnets = FloatingIpPoolSubnetType(subnet_uuid = [svc_subnet_uuid])
-        fip_pool_obj = FloatingIpPool(
-            self._get_cluster_service_fip_pool_name(vn_obj.name),
-            floating_ip_pool_subnets = fip_subnets,
-            parent_obj=vn_obj)
-
-        try:
-            # Create floating ip pool for cluster service network.
-            self.vnc_lib.floating_ip_pool_create(fip_pool_obj)
-        except RefsExistError:
-            # Floating-ip-pool exists.
-            #
-            # Validate that existing floating-ip-pool has the service subnet
-            # uuid as one of its subnets. If not raise an exception, as the
-            # floating-ip-pool cannot be created, as one with the same name but
-            # different attributes exists in the system.
-            fip_pool_db_obj = self._get_cluster_service_fip_pool()
-            svc_subnet_found = False
-            fip_subnets = None
-
-            if hasattr(fip_pool_db_obj, 'floating_ip_pool_subnets'):
-                fip_subnets = fip_pool_db_obj.floating_ip_pool_subnets
-
-            if fip_subnets:
-                for subnet in fip_subnets['subnet_uuid']:
-                    if subnet == svc_subnet_uuid:
-                        svc_subnet_found = True
-                        break
-
-            if not svc_subnet_found:
-                # Requested service subnet was not found in existing fip pool.
-                # Update existing fip pool entry with desired subnet.
-                self.logger.debug("Failed to create floating-ip-pool %s for"\
-                    "subnet %s. A floating-ip-pool with same name exists."\
-                    " Update existing entry." %\
-                    (":".join(fip_pool_db_obj.fq_name), svc_subnet_uuid))
-
-                # Update vnc.
-                self.vnc_lib.floating_ip_pool_update(fip_pool_obj)
-                # Update subnet info in local cache.
-                fip_subnets['subnet_uuid'] = [svc_subnet_uuid]
-
-        else:
-            # Read and update local cache.
-            fip_pool_obj = self.vnc_lib.floating_ip_pool_read(
-                fq_name=fip_pool_obj.fq_name)
-            FloatingIpPoolKM.locate(fip_pool_obj.get_uuid())
-
-        return
-
-    def _provision_cluster(self):
-        self._create_project('kube-system')
-        proj_obj = self._create_project(\
-            vnc_kube_config.cluster_default_project_name())
-        self._create_cluster_network(\
-            vnc_kube_config.cluster_default_network_name(), proj_obj)
+        return vn_obj
 
     def _get_cluster_network(self):
         return VirtualNetworkKM.find_by_name_or_uuid(

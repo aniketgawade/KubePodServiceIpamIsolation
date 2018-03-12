@@ -12,7 +12,8 @@ from vnc_api.vnc_api import (
     AddressType, IpamSubnets, IdPermsType, IpamSubnetType, NetworkIpam,
     NoIdError, PolicyEntriesType, PolicyRuleType, PortType, Project,
     RefsExistError, SecurityGroup, SubnetType, VirtualNetwork,
-    VirtualNetworkType, VnSubnetsType)
+    VirtualNetworkType, VnSubnetsType, NetworkPolicy, ActionListType,
+    VirtualNetworkPolicyType, SequenceType)
 from kube_manager.vnc.config_db import (
     NetworkIpamKM, VirtualNetworkKM, ProjectKM, SecurityGroupKM)
 from kube_manager.common.kube_config_db import NamespaceKM
@@ -32,6 +33,14 @@ class VncNamespace(VncCommon):
         self._label_cache = vnc_kube_config.label_cache()
         self._logger = vnc_kube_config.logger()
         self._queue = vnc_kube_config.queue()
+        ip_fabric_fq_name = vnc_kube_config. \
+            cluster_ip_fabric_network_fq_name()
+        self._ip_fabric_vn_obj = self._vnc_lib. \
+            virtual_network_read(fq_name=ip_fabric_fq_name)
+        cluster_service_network_fq_name = vnc_kube_config. \
+            cluster_default_service_network_fq_name()
+        self._cluster_service_vn_obj = self._vnc_lib. \
+            virtual_network_read(fq_name=cluster_service_network_fq_name)
 
     def _get_namespace(self, ns_name):
         """
@@ -47,11 +56,11 @@ class VncNamespace(VncCommon):
         if ns:
             NamespaceKM.delete(ns.uuid)
 
-    def _get_namespace_vn_name(self, ns_name):
-        return ns_name + "-vn"
+    def _get_namespace_pod_vn_name(self, ns_name):
+        return ns_name + "-pod-network"
 
     def _get_namespace_service_vn_name(self, ns_name):
-        return ns_name + "-service-vn"
+        return ns_name + "-service-network"
 
     def _is_namespace_isolated(self, ns_name):
         """
@@ -75,17 +84,6 @@ class VncNamespace(VncCommon):
         # By default, namespace is not isolated.
         return False
 
-    def _is_service_isolated(self, ns_name):
-        """
-        Check if service  is configured as isolated.
-        """
-        ns = self._get_namespace(ns_name)
-        if ns:
-            return ns.is_service_isolated()
-
-        # By default, service is not isolated.
-        return False
-
     def _get_network_policy_annotations(self, ns_name):
         ns = self._get_namespace(ns_name)
         if ns:
@@ -98,10 +96,10 @@ class VncNamespace(VncCommon):
             return ns.get_annotated_network_fq_name()
         return None
 
-    def _set_namespace_virtual_network(self, ns_name, fq_name):
+    def _set_namespace_pod_virtual_network(self, ns_name, fq_name):
         ns = self._get_namespace(ns_name)
         if ns:
-            return ns.set_isolated_network_fq_name(fq_name)
+            return ns.set_isolated_pod_network_fq_name(fq_name)
         return None
 
     def _set_namespace_service_virtual_network(self, ns_name, fq_name):
@@ -130,44 +128,8 @@ class VncNamespace(VncCommon):
         if labels:
             project.ns_labels[ns_uuid] = labels
 
-    def _create_ipam(self, ipam_name, subnets, proj_obj, ipam_type):
-        """
-        Create an ipam.
-        If an ipam with same name exists, return the existing object.
-        """
-        ipam_subnets = []
-        for subnet in subnets:
-            pfx, pfx_len = subnet.split('/')
-            ipam_subnet = IpamSubnetType(subnet=SubnetType(pfx, int(pfx_len)))
-            ipam_subnets.append(ipam_subnet)
-
-        ipam_obj = NetworkIpam(name=ipam_name, parent_obj=proj_obj)
-        if ipam_type == 'flat-subnet':
-            ipam_obj.set_ipam_subnet_method('flat-subnet')
-            ipam_obj.set_ipam_subnets(IpamSubnets(ipam_subnets))
-
-        try:
-            self._vnc_lib.network_ipam_create(ipam_obj)
-        except RefsExistError:
-            pass
-
-        ipam = self._vnc_lib.network_ipam_read(fq_name=ipam_obj.get_fq_name())
-
-        # Cache ipam info.
-        NetworkIpamKM.locate(ipam.uuid)
-
-        return ipam_obj, ipam_subnets
-
-    def _delete_ipam(self, ipam):
-        """
-        Delete the requested ipam.
-        """
-        self._vnc_lib.network_ipam_delete(id=ipam['uuid'])
-
-        # Remove the ipam from cache.
-        NetworkIpamKM.delete(ipam['uuid'])
-
-    def _create_isolated_ns_virtual_network(self, ns_name, vn_name, proj_obj):
+    def _create_isolated_ns_virtual_network(self, ns_name, vn_name,
+                    proj_obj, ipam_obj=None, provider=None):
         """
         Create a virtual network for this namespace.
         """
@@ -190,10 +152,11 @@ class VncNamespace(VncCommon):
         # Instance-Ip for pods on this VN, should be allocated from
         # cluster pod ipam. Attach the cluster pod-ipam object
         # to this virtual network.
-        ipam_fq_name = vnc_kube_config.pod_ipam_fq_name()
-        ipam_obj = self._vnc_lib.network_ipam_read(
-            fq_name=ipam_fq_name)
         vn.add_network_ipam(ipam_obj, VnSubnetsType([]))
+
+        # enable ip-fabric-forwarding
+        if provider:
+            vn.add_virtual_network(provider)
 
         # Update VN.
         self._vnc_lib.virtual_network_update(vn)
@@ -201,10 +164,7 @@ class VncNamespace(VncCommon):
         # Cache the virtual network.
         VirtualNetworkKM.locate(vn_uuid)
 
-        # Cache network info in namespace entry.
-        self._set_namespace_virtual_network(ns_name, vn.get_fq_name())
-
-        return vn_uuid
+        return vn
 
     def _delete_isolated_ns_virtual_network(self, ns_name, vn_name,
                                             proj_fq_name):
@@ -217,10 +177,16 @@ class VncNamespace(VncCommon):
             return
 
         try:
-            # Delete/cleanup ipams allocated for this network.
             vn_obj = self._vnc_lib.virtual_network_read(fq_name=vn.fq_name)
-            if vn_obj.get_network_ipam_refs():
-                ipam_refs = vn_obj.get_network_ipam_refs()
+            # Delete/cleanup network policy allocated for this network.
+            network_policy_refs = vn_obj.get_network_policy_refs()
+            if network_policy_refs:
+                for network_policy_ref in network_policy_refs:
+                    self._vnc_lib. \
+                        network_policy_delete(id=network_policy_ref['uuid'])
+            # Delete/cleanup ipams allocated for this network.
+            ipam_refs = vn_obj.get_network_ipam_refs()
+            if ipam_refs:
                 proj_obj = self._vnc_lib.project_read(fq_name=proj_fq_name)
                 for ipam in ipam_refs:
                     ipam_obj = NetworkIpam(
@@ -236,52 +202,75 @@ class VncNamespace(VncCommon):
         # Delete the network from cache.
         VirtualNetworkKM.delete(vn.uuid)
 
-        # Clear network info from namespace entry.
-        self._set_namespace_virtual_network(ns_name, None)
-
-    def _create_isolated_ns_service_virtual_network(self, ns_name, vn_name, proj_obj):
-        """
-        Create a service virtual network for this namespace.
-        """
-        vn = VirtualNetwork(name=vn_name, parent_obj=proj_obj,
-            virtual_network_properties=VirtualNetworkType(forwarding_mode='l3'),
-            address_allocation_mode='flat-subnet-only')
-
-        # Add annotatins on this isolated service virtual-network.
-        VirtualNetworkKM.add_annotations(self, vn, namespace=ns_name,
-            name=ns_name, isolated='True')
-
+    def _create_policy(self, policy_name, proj_obj, src_vn_obj, dst_vn_obj):
+        policy_exists = False
+        policy = NetworkPolicy(name=policy_name, parent_obj=proj_obj)
         try:
-            vn_uuid = self._vnc_lib.virtual_network_create(vn)
-        except RefsExistError:
-            vn_obj = self._vnc_lib.virtual_network_read(
-                fq_name=vn.get_fq_name())
-            vn_uuid = vn_obj.uuid
+            policy_obj = self._vnc_lib.network_policy_read(
+                fq_name=policy.get_fq_name())
+            policy_exists = True
+        except NoIdError:
+            # policy does not exist. Create one.
+            policy_obj = policy
+        network_policy_entries = PolicyEntriesType(
+            [PolicyRuleType(
+                direction = '<>',
+                action_list = ActionListType(simple_action='pass'),
+                protocol = 'any',
+                src_addresses = [
+                    AddressType(virtual_network = src_vn_obj.get_fq_name_str())
+                ],
+                src_ports = [PortType(-1, -1)],
+                dst_addresses = [
+                    AddressType(virtual_network = dst_vn_obj.get_fq_name_str())
+                ],
+                dst_ports = [PortType(-1, -1)])
+            ])
+        policy_obj.set_network_policy_entries(network_policy_entries)
+        if policy_exists:
+            self._vnc_lib.network_policy_update(policy)
+        else:
+            self._vnc_lib.network_policy_create(policy)
+        return policy_obj
 
-        # Instance-Ip for pods on this VN, should be allocated from
-        # cluster pod ipam. Attach the cluster pod-ipam object
-        # to this virtual network.
-        ipam_obj = self._vnc_lib.network_ipam_read(
-            fq_name=vnc_kube_config.service_ipam_fq_name())
-        vn.add_network_ipam(ipam_obj, VnSubnetsType([]))
+    def _attach_policy(self, vn_obj, *policies):
+        for policy in policies or []:
+            vn_obj.add_network_policy(policy, \
+                VirtualNetworkPolicyType(sequence=SequenceType(0, 0)))
+        self._vnc_lib.virtual_network_update(vn_obj)
+        for policy in policies or []:
+            self._vnc_lib.ref_relax_for_delete(vn_obj.uuid, policy.uuid)
 
-        # Update VN.
-        self._vnc_lib.virtual_network_update(vn)
-
-        # Cache the virtual network.
-        VirtualNetworkKM.locate(vn_uuid)
-
-        # Cache network info in namespace entry.
-        self._set_namespace_service_virtual_network(ns_name, vn.get_fq_name())
-
-        return vn_uuid
+    def _create_attach_policy(self, proj_obj, ip_fabric_vn_obj, \
+            pod_vn_obj, service_vn_obj):
+        policy_name = '%s-%s-default' \
+            %(ip_fabric_vn_obj.name, pod_vn_obj.name)
+        ip_fabric_pod_policy = self._create_policy(policy_name, proj_obj, \
+            ip_fabric_vn_obj, pod_vn_obj)
+        policy_name = '%s-%s-default' \
+            %(ip_fabric_vn_obj.name, service_vn_obj.name)
+        ip_fabric_service_policy = self._create_policy(policy_name, proj_obj, \
+            ip_fabric_vn_obj, service_vn_obj)
+        policy_name = '%s-%s-default'\
+            %(service_vn_obj.name, pod_vn_obj.name)
+        service_pod_policy = self._create_policy(policy_name, proj_obj, \
+            service_vn_obj, pod_vn_obj)
+        self._attach_policy(ip_fabric_vn_obj, \
+            ip_fabric_pod_policy, ip_fabric_service_policy)
+        self._attach_policy(pod_vn_obj, \
+            ip_fabric_pod_policy, service_pod_policy)
+        self._attach_policy(service_vn_obj, \
+            ip_fabric_service_policy, service_pod_policy)
 
     def _update_security_groups(self, ns_name, proj_obj, network_policy):
         def _get_rule(ingress, sg, prefix, ethertype):
             sgr_uuid = str(uuid.uuid4())
             if sg:
-                addr = AddressType(
-                    security_group=proj_obj.get_fq_name_str() + ':' + sg)
+                if ':' not in sg:
+                    sg_fq_name = proj_obj.get_fq_name_str() + ':' + sg
+                else:
+                    sg_fq_name = sg
+                addr = AddressType(security_group=sg_fq_name)
             elif prefix:
                 addr = AddressType(subnet=SubnetType(prefix, 0))
             local_addr = AddressType(security_group='local')
@@ -317,12 +306,8 @@ class VncNamespace(VncCommon):
                 if isolation == 'DefaultDeny':
                     ingress = False
         if ingress:
-            if self._is_service_isolated(ns_name):
-                rules.append(_get_rule(True, sg_name, None, 'IPv4'))
-                rules.append(_get_rule(True, sg_name, None, 'IPv6'))
-            else:
-                rules.append(_get_rule(True, None, '0.0.0.0', 'IPv4'))
-                rules.append(_get_rule(True, None, '::', 'IPv6'))
+            rules.append(_get_rule(True, None, '0.0.0.0', 'IPv4'))
+            rules.append(_get_rule(True, None, '::', 'IPv6'))
         if egress:
             rules.append(_get_rule(False, None, '0.0.0.0', 'IPv4'))
             rules.append(_get_rule(False, None, '::', 'IPv6'))
@@ -399,14 +384,24 @@ class VncNamespace(VncCommon):
 
         # If this namespace is isolated, create it own network.
         if self._is_namespace_isolated(name) == True:
-            vn_name = self._get_namespace_vn_name(name)
-            self._create_isolated_ns_virtual_network(ns_name=name,
-                                                     vn_name=vn_name,
-                                                     proj_obj=proj_obj)
-            svc_vn_name = self._get_namespace_service_vn_name(name)
-            self._create_isolated_ns_service_virtual_network(ns_name=name,
-                                                     vn_name=svc_vn_name,
-                                                     proj_obj=proj_obj)
+            vn_name = self._get_namespace_pod_vn_name(name)
+            ipam_fq_name = vnc_kube_config.pod_ipam_fq_name()
+            ipam_obj = self._vnc_lib.network_ipam_read(fq_name=ipam_fq_name)
+            pod_vn = self._create_isolated_ns_virtual_network( \
+                    ns_name=name, vn_name=vn_name, proj_obj=proj_obj,
+                    ipam_obj=ipam_obj, provider=self._ip_fabric_vn_obj)
+            # Cache pod network info in namespace entry.
+            self._set_namespace_pod_virtual_network(name, pod_vn.get_fq_name())
+            vn_name = self._get_namespace_service_vn_name(name)
+            ipam_fq_name = vnc_kube_config.service_ipam_fq_name()
+            ipam_obj = self._vnc_lib.network_ipam_read(fq_name=ipam_fq_name)
+            service_vn = self._create_isolated_ns_virtual_network( \
+                    ns_name=name, vn_name=vn_name,
+                    ipam_obj=ipam_obj,proj_obj=proj_obj)
+            # Cache service network info in namespace entry.
+            self._set_namespace_service_virtual_network(name, service_vn.get_fq_name())
+            self._create_attach_policy(proj_obj, self._ip_fabric_vn_obj, \
+                    pod_vn, service_vn)
 
         try:
             network_policy = self._get_network_policy_annotations(name)
@@ -445,9 +440,16 @@ class VncNamespace(VncCommon):
         try:
             # If the namespace is isolated, delete its virtual network.
             if self._is_namespace_isolated(name):
-                vn_name = self._get_namespace_vn_name(name)
+                vn_name = self._get_namespace_pod_vn_name(name)
                 self._delete_isolated_ns_virtual_network(
                     name, vn_name=vn_name, proj_fq_name=proj_fq_name)
+                # Clear pod network info from namespace entry.
+                self._set_namespace_pod_virtual_network(name, None)
+                vn_name = self._get_namespace_service_vn_name(name)
+                self._delete_isolated_ns_virtual_network(
+                    name, vn_name=vn_name, proj_fq_name=proj_fq_name)
+                # Clear service network info from namespace entry.
+                self._set_namespace_service_virtual_network(name, None)
 
             # delete default-sg and ns-sg security groups
             security_groups = project.get_security_groups()

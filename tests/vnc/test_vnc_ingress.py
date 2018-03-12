@@ -18,7 +18,7 @@ from cfgm_common.exceptions import NoIdError
 from kube_manager.vnc import vnc_kubernetes_config as kube_config
 from kube_manager.common.kube_config_db import NamespaceKM, ServiceKM, IngressKM
 from kube_manager.tests.vnc.test_case import KMTestCase
-from kube_manager.vnc.config_db import ProjectKM
+from kube_manager.vnc.config_db import ProjectKM, VirtualRouterKM
 from kube_manager.vnc.vnc_kubernetes import VncKubernetes
 from vnc_api.gen.resource_client import VirtualNetwork, FloatingIpPool
 from vnc_api.gen.resource_xsd import IpamSubnetType, SubnetType, VnSubnetsType
@@ -723,8 +723,13 @@ class VncIngressTest(KMTestCase):
         return subnet_data
 
     def _create_vrouter_for_vm(self, vmi, vm):
-        vrouter_obj = VirtualRouter('phys-host-1' + vmi.uuid)
+        vrouter_obj = VirtualRouter('phys-host-1' + vmi.uuid,
+            virtual_router_ip_address = self.get_kubernetes_node_ip())
         self._vnc_lib.virtual_router_create(vrouter_obj)
+        vrouter_obj = self._vnc_lib.virtual_router_read(
+            fq_name=vrouter_obj.get_fq_name())
+        VirtualRouterKM.locate(vrouter_obj.get_uuid(), vrouter_obj)
+
         vrouter_obj.set_virtual_machine(vm)
         self._vnc_lib.virtual_router_update(vrouter_obj)
         return vrouter_obj
@@ -747,11 +752,9 @@ class VncIngressTest(KMTestCase):
         vrouter_uuids = []
 
         for vm_dict in si.virtual_machine_back_refs:
-            vm = self._vnc_lib.virtual_machine_read(
-                id=vm_dict['uuid'],
-                fields=['virtual_machine_interface_back_refs'])
+            vm = self._vnc_lib.virtual_machine_read(id=vm_dict['uuid'])
             vmi = self._vnc_lib.virtual_machine_interface_read(
-                id=vm.virtual_machine_interface_back_refs[0]['uuid'])
+                id=vm.get_virtual_machine_interface_back_refs()[0]['uuid'])
             vrouter = self._create_vrouter_for_vm(vmi=vmi, vm=vm)
             vrouter_uuids.append(vrouter.uuid)
 
@@ -853,6 +856,9 @@ class VncIngressTest(KMTestCase):
 
         for vn in project.get_virtual_networks() or ():
             self._delete_virtual_network(vn['uuid'])
+
+        for np in project.get_network_policys() or ():
+            self._vnc_lib.network_policy_delete(id=np['uuid'])
 
         self._vnc_lib.project_delete(fq_name=project_fq_name)
         ProjectKM.delete(project.uuid)
